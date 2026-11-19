@@ -1,3 +1,8 @@
+"""
+GTA VI Trophy Rarity Forecast Model.
+Model summary: Saturation growth & player progression + refresh-aware quantile spread in logit space with long-horizon scaling.
+"""
+
 import os
 import json
 import math
@@ -78,7 +83,6 @@ def process_case(case_path, output_dir):
 
         if is_flat_players:
             # When history is flat, earned players grow with players, but maybe slightly slower or faster depending on trophy type
-            # For launch night, early players have higher rates, refresh brings in broader player base so rates might drop slightly or earned count scales sublinearly / linearly.
             earned_growth_factor = (forecast_players / last_players) ** 0.85
             forecast_earned = last_earned * earned_growth_factor
         else:
@@ -99,26 +103,32 @@ def process_case(case_path, output_dir):
         if last_rate >= 99.0:
             forecast_rate = 100.0
 
-        # Generate quantiles [q05, q25, q50, q75, q95]
-        # Since prompt instructs: "so your model must handle a sudden refresh jump: spread your upper quantiles generously on early flat histories."
+        # Generate quantiles [q05, q25, q50, q75, q95] in logit (log) space
         median_rate = forecast_rate
+        l_median = logit(median_rate)
         
-        # Determine spread / uncertainty
-        # On early flat histories, uncertainty is asymmetric and wide, especially upward.
+        # Determine log-space spread / uncertainty
         base_spread = 0.5 * (horizon_minutes / 90.0)
-        if is_flat_players:
-            # Spread upper quantiles generously
-            spread_down = max(0.2, median_rate * 0.3 + base_spread)
-            spread_up = max(1.0, (100.0 - median_rate) * 0.4 + base_spread * 2.0)
-        else:
-            spread_down = max(0.1, median_rate * 0.15)
-            spread_up = max(0.2, (100.0 - median_rate) * 0.15)
+        long_horizon_scale = 1.2 if horizon_minutes > 1000 else 1.0
 
-        q50 = median_rate
-        q05 = max(0.0, q50 - spread_down * 1.5)
-        q25 = max(0.0, q50 - spread_down * 0.6)
-        q75 = min(100.0, q50 + spread_up * 0.8)
-        q95 = min(100.0, q50 + spread_up * 2.0)
+        if is_flat_players:
+            spread_down = max(0.2, (median_rate * 0.3 + base_spread) / 25.0) * long_horizon_scale
+            spread_up = max(0.5, ((100.0 - median_rate) * 0.4 + base_spread * 2.0) / 25.0) * long_horizon_scale
+        else:
+            spread_down = max(0.1, (median_rate * 0.15) / 25.0) * long_horizon_scale
+            spread_up = max(0.1, ((100.0 - median_rate) * 0.15) / 25.0) * long_horizon_scale
+
+        l_05 = l_median - spread_down * 1.5
+        l_25 = l_median - spread_down * 0.6
+        l_50 = l_median
+        l_75 = l_median + spread_up * 0.8
+        l_95 = l_median + spread_up * 2.0
+
+        q05 = inv_logit(l_05)
+        q25 = inv_logit(l_25)
+        q50 = inv_logit(l_50)
+        q75 = inv_logit(l_75)
+        q95 = inv_logit(l_95)
 
         # Ensure monotonicity: q05 <= q25 <= q50 <= q75 <= q95
         q05 = min(q05, q25, q50, q75, q95)
