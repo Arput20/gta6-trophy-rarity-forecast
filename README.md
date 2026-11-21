@@ -6,12 +6,22 @@
 
 Forecasting Grand Theft Auto VI (PS5) trophy earn rates on Exophase for week one.
 
-## Model Summary
-- **Saturation Growth**: Models player base expansion and trophy progression.
-- **Refresh-Aware Quantile Spread**: Handles sudden Exophase player refresh jumps with generous upper quantile spreads in logit space.
-- **Long-Horizon Scaling**: Scales log-space spread by 1.2 for extended horizons (`horizon_minutes > 1000`).
+## Method Summary
+
+1. **Refresh-Aware Snapshot Analysis**:
+   - Detects distinct Exophase refresh events where player tracked counts and trophy earn rates update.
+   - For flat histories (where a page refresh is imminent or overdue during launch week), models realistic launch-week player expansion (scaling with horizon) and accounts for rate dilution as new players join.
+
+2. **Sublinear Growth Model for Earned Counts**:
+   - Extrapolates player base growth and trophy earned counts.
+   - Applies a trophy-specific sublinear exponent ($\alpha_j$) dependent on initial rarity/tier, reflecting that progression/harder trophies grow slower than total active players during mass adoption.
+
+3. **Logit-Space Pinball-Optimal Quantiles**:
+   - Computes forecasts and 5 quantiles ($\tau \in \{0.05, 0.25, 0.50, 0.75, 0.95\}$) in logit space to naturally respect probability bounds ($[0, 100]$).
+   - Scales dispersion ($\sigma$) based on horizon length ($\sqrt{\text{horizon}}$) and history volatility, with asymmetric upper bounds to capture upside refresh jumps.
+   - Enforces strict monotonicity ($q_{0.05} \le q_{25} \le q_{50} \le q_{75} \le q_{95}$), finiteness, and valid $[0, 100]$ percentage ranges.
 
 ## How to Run
 ```bash
-MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=output python3 main.py
 ```

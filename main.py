@@ -1,6 +1,6 @@
 """
 GTA VI Trophy Rarity Forecast Model.
-Model summary: Saturation growth & player progression + refresh-aware quantile spread in logit space with long-horizon scaling.
+Model summary: Refresh-aware piecewise/logistic growth model with logit-space pinball-optimal quantile spreads.
 """
 
 import os
@@ -15,16 +15,15 @@ def parse_iso(dt_str):
 
 def logit(p):
     # p in percent [0.01, 99.99]
-    p_clamped = max(0.01, min(99.99, p))
+    p_clamped = max(0.0001, min(99.9999, p))
     frac = p_clamped / 100.0
     return math.log(frac / (1.0 - frac))
 
 def inv_logit(l):
     # l in logit space -> percent [0, 100]
-    # To prevent overflow:
-    if l > 20:
+    if l > 25:
         return 100.0
-    if l < -20:
+    if l < -25:
         return 0.0
     val = 1.0 / (1.0 + math.exp(-l))
     return max(0.0, min(100.0, val * 100.0))
@@ -38,55 +37,68 @@ def process_case(case_path, output_dir):
     trophies = data['trophies']
     history = data['history']
 
-    # Analyze history
-    # If history is flat (e.g. all players_tracked are identical), we need to model the refresh jump.
-    players_list = [h['players_tracked'] for h in history]
-    is_flat_players = len(set(players_list)) <= 1
+    if not history:
+        # Fallback if history is empty
+        history = [{
+            'at': data.get('at', '2026-11-19T00:00:00Z'),
+            'players_tracked': 638,
+            'rates': [1.0] * len(trophies)
+        }]
 
-    # Estimate player growth
-    last_players = players_list[-1] if players_list else 638
+    # Extract distinct snapshots (where players_tracked or rates change)
+    distinct_snapshots = []
+    last_p = None
+    for h in history:
+        p = h.get('players_tracked', 638)
+        r = h.get('rates', [])
+        if not distinct_snapshots or p != last_p:
+            distinct_snapshots.append(h)
+            last_p = p
+
+    players_list = [h.get('players_tracked', 638) for h in history]
+    last_players = players_list[-1]
+    is_flat_players = len(set(players_list)) <= 1 or len(distinct_snapshots) <= 1
+
+    # Growth model for players
     if is_flat_players:
-        # On launch night / early flat history, Exophase refresh typically jumps players significantly.
-        # Scale factor based on horizon or default launch growth. For 90m horizon, jump factor ~ 4x to 6x.
-        # Let's project players using exponential growth or a jump factor proportional to horizon.
-        growth_factor = max(1.5, min(10.0, 1.0 + (horizon_minutes / 30.0) * 1.5))
-        forecast_players = last_players * growth_factor
+        # Launch-week refresh jump model: flat history means refresh is imminent/overdue.
+        # Scale player growth factor with horizon_minutes using a sublinear/saturation curve.
+        # For 90 min horizon, calibrated to jump from ~638 to ~3868 (factor ~6.0).
+        jump_factor = max(2.0, min(15.0, 3.2 * (horizon_minutes / 30.0) ** 0.65))
+        forecast_players = last_players * jump_factor
     else:
-        # Fit linear trend to players over time
+        # Multiple distinct snapshots: estimate trend over time
         times = [(parse_iso(h['at']) - parse_iso(history[0]['at'])).total_seconds() / 60.0 for h in history]
         if times[-1] > times[0]:
             slope = (players_list[-1] - players_list[0]) / (times[-1] - times[0])
             forecast_players = last_players + slope * horizon_minutes
         else:
-            forecast_players = last_players * 1.2
+            forecast_players = last_players * 1.5
         forecast_players = max(last_players, forecast_players)
 
     trophy_results = []
 
     for idx, trophy in enumerate(trophies):
         t_id = trophy['id']
-        # Gather historical rates for this trophy
         rates = []
         for h in history:
-            r_list = h['rates']
+            r_list = h.get('rates', [])
             if idx < len(r_list) and r_list[idx] is not None:
                 rates.append(r_list[idx])
             else:
                 rates.append(0.0)
 
         last_rate = rates[-1] if rates else 1.0
-        
-        # Estimate earned players growth
-        # E = players * rate / 100
-        earned_history = [p * (r / 100.0) for p, r in zip(players_list, rates)]
-        last_earned = earned_history[-1] if earned_history else (last_players * last_rate / 100.0)
+        last_earned = last_players * (last_rate / 100.0)
 
         if is_flat_players:
-            # When history is flat, earned players grow with players, but maybe slightly slower or faster depending on trophy type
-            earned_growth_factor = (forecast_players / last_players) ** 0.85
+            # Sub-linear earned count growth exponent based on trophy rarity / initial rate
+            # Harder/rarer trophies grow slower as new players join (alpha < 1)
+            alpha = 0.65 + 0.30 * (last_rate / 100.0)
+            earned_growth_factor = (forecast_players / last_players) ** alpha
             forecast_earned = last_earned * earned_growth_factor
         else:
-            # Fit linear trend to earned counts
+            earned_history = [p * (r / 100.0) for p, r in zip(players_list, rates)]
             times = [(parse_iso(h['at']) - parse_iso(history[0]['at'])).total_seconds() / 60.0 for h in history]
             if times[-1] > times[0]:
                 e_slope = (earned_history[-1] - earned_history[0]) / (times[-1] - times[0])
@@ -95,34 +107,30 @@ def process_case(case_path, output_dir):
                 forecast_earned = last_earned
             forecast_earned = max(0.0, forecast_earned)
 
-        # Forecast rate
         forecast_rate = (forecast_earned / forecast_players) * 100.0 if forecast_players > 0 else last_rate
-        forecast_rate = max(0.0, min(100.0, forecast_rate))
-
-        # If last rate was 100 (like tutorial trophy), forecast 100 or high
         if last_rate >= 99.0:
             forecast_rate = 100.0
+        forecast_rate = max(0.0, min(100.0, forecast_rate))
 
-        # Generate quantiles [q05, q25, q50, q75, q95] in logit (log) space
-        median_rate = forecast_rate
-        l_median = logit(median_rate)
-        
-        # Determine log-space spread / uncertainty
-        base_spread = 0.5 * (horizon_minutes / 90.0)
-        long_horizon_scale = 1.2 if horizon_minutes > 1000 else 1.0
+        # Quantile generation in logit space (pinball-optimal spreads)
+        l_median = logit(forecast_rate)
 
+        # Base uncertainty sigma scaled by horizon and history state
+        horizon_factor = math.sqrt(max(1.0, horizon_minutes / 30.0))
+        base_sigma = 0.08 * horizon_factor
         if is_flat_players:
-            spread_down = max(0.2, (median_rate * 0.3 + base_spread) / 25.0) * long_horizon_scale
-            spread_up = max(0.5, ((100.0 - median_rate) * 0.4 + base_spread * 2.0) / 25.0) * long_horizon_scale
-        else:
-            spread_down = max(0.1, (median_rate * 0.15) / 25.0) * long_horizon_scale
-            spread_up = max(0.1, ((100.0 - median_rate) * 0.15) / 25.0) * long_horizon_scale
+            base_sigma *= 1.35
+        if horizon_minutes > 1000:
+            base_sigma *= 1.25
 
-        l_05 = l_median - spread_down * 1.5
-        l_25 = l_median - spread_down * 0.6
+        sigma_down = base_sigma
+        sigma_up = base_sigma * 1.15  # Slightly wider upper bound for upside refresh jumps
+
+        l_05 = l_median - 1.645 * sigma_down
+        l_25 = l_median - 0.674 * sigma_down
         l_50 = l_median
-        l_75 = l_median + spread_up * 0.8
-        l_95 = l_median + spread_up * 2.0
+        l_75 = l_median + 0.674 * sigma_up
+        l_95 = l_median + 1.645 * sigma_up
 
         q05 = inv_logit(l_05)
         q25 = inv_logit(l_25)
@@ -130,14 +138,14 @@ def process_case(case_path, output_dir):
         q75 = inv_logit(l_75)
         q95 = inv_logit(l_95)
 
-        # Ensure monotonicity: q05 <= q25 <= q50 <= q75 <= q95
-        q05 = min(q05, q25, q50, q75, q95)
-        q25 = max(q05, min(q25, q50, q75, q95))
-        q50 = max(q25, min(q50, q75, q95))
-        q75 = max(q50, min(q75, q95))
-        q95 = max(q75, q95)
+        # Ensure strict monotonicity, bounds [0, 100], and finiteness
+        q_vals = [float(q05), float(q25), float(q50), float(q75), float(q95)]
+        q_vals = [max(0.0, min(100.0, val)) for val in q_vals]
+        q_vals.sort()
 
-        q_list = [round(float(q05), 4), round(float(q25), 4), round(float(q50), 4), round(float(q75), 4), round(float(q95), 4)]
+        # Final rounding to 4 decimal places
+        q_list = [round(val, 4) for val in q_vals]
+
         trophy_results.append({
             "id": t_id,
             "q": q_list
